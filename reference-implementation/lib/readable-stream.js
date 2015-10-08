@@ -6,6 +6,310 @@ import { DequeueValue, EnqueueValueWithSize, GetTotalQueueSize } from './queue-w
 
 export default class ReadableStream {
   constructor(underlyingSource = {}, { size, highWaterMark = 1 } = {}) {
+    this._reader = undefined;
+    this._disturbed = false;
+    this._storedError = undefined;
+
+    // TODO: does this inadvertently allow creation of ReadableStreamControllers independently? That is probably bad?
+    this._controller = new ReadableStreamController(underlyingSource, size, highWaterMark);
+  }
+
+  get locked() {
+    if (IsReadableStream(this) === false) {
+      throw new TypeError('ReadableStream.prototype.locked can only be used on a ReadableStream');
+    }
+
+    return IsReadableStreamLocked(this);
+  }
+
+  cancel(reason) {
+    if (IsReadableStream(this) === false) {
+      return Promise.reject(new TypeError('ReadableStream.prototype.cancel can only be used on a ReadableStream'));
+    }
+
+    if (IsReadableStreamLocked(this) === true) {
+      return Promise.reject(new TypeError('Cannot cancel a stream that already has a reader'));
+    }
+
+    if (this._controller._state === 'closed') {
+      return Promise.resolve(undefined);
+    }
+    if (this._controller._state === 'errored') {
+      return Promise.reject(this._storedError);
+    }
+
+    this._controller._state = 'closed';
+
+    FinishClosingReadableStream(this);
+
+    return this._controller._Cancel(reason);
+  }
+
+  getReader() {
+    if (IsReadableStream(this) === false) {
+      throw new TypeError('ReadableStream.prototype.getReader can only be used on a ReadableStream');
+    }
+
+    return AcquireReadableStreamReader(this);
+  }
+
+  pipeThrough({ writable, readable }, options) {
+    this.pipeTo(writable, options);
+    return readable;
+  }
+
+  // TODO: pipeTo and tee should delegate to controller instead of using purely public API
+  pipeTo(dest, { preventClose, preventAbort, preventCancel } = {}) {
+    preventClose = Boolean(preventClose);
+    preventAbort = Boolean(preventAbort);
+    preventCancel = Boolean(preventCancel);
+
+    const source = this;
+
+    let reader;
+    let lastRead;
+    let lastWrite;
+    let closedPurposefully = false;
+    let resolvePipeToPromise;
+    let rejectPipeToPromise;
+
+    return new Promise((resolve, reject) => {
+      resolvePipeToPromise = resolve;
+      rejectPipeToPromise = reject;
+
+      reader = source.getReader();
+
+      reader.closed.catch(abortDest);
+      dest.closed.then(
+        () => {
+          if (!closedPurposefully) {
+            cancelSource(new TypeError('destination is closing or closed and cannot be piped to anymore'));
+          }
+        },
+        cancelSource
+      );
+
+      doPipe();
+    });
+
+    function doPipe() {
+      lastRead = reader.read();
+      Promise.all([lastRead, dest.ready]).then(([{ value, done }]) => {
+        if (Boolean(done) === true) {
+          closeDest();
+        } else if (dest.state === 'writable') {
+          lastWrite = dest.write(value);
+          doPipe();
+        }
+      })
+      .catch(rethrowAssertionErrorRejection);
+
+      // Any failures will be handled by listening to reader.closed and dest.closed above.
+      // TODO: handle malicious dest.write/dest.close?
+    }
+
+    function cancelSource(reason) {
+      if (preventCancel === false) {
+        reader.cancel(reason);
+        reader.releaseLock();
+        rejectPipeToPromise(reason);
+      } else {
+        // If we don't cancel, we need to wait for lastRead to finish before we're allowed to release.
+        // We don't need to handle lastRead failing because that will trigger abortDest which takes care of
+        // both of these.
+        lastRead.then(() => {
+          reader.releaseLock();
+          rejectPipeToPromise(reason);
+        });
+      }
+    }
+
+    function closeDest() {
+      // Does not need to wait for lastRead since it occurs only on source closed.
+
+      reader.releaseLock();
+
+      const destState = dest.state;
+      if (preventClose === false && (destState === 'waiting' || destState === 'writable')) {
+        closedPurposefully = true;
+        dest.close().then(resolvePipeToPromise, rejectPipeToPromise);
+      } else if (lastWrite !== undefined) {
+        lastWrite.then(resolvePipeToPromise, rejectPipeToPromise);
+      } else {
+        resolvePipeToPromise();
+      }
+    }
+
+    function abortDest(reason) {
+      // Does not need to wait for lastRead since it only occurs on source errored.
+
+      reader.releaseLock();
+
+      if (preventAbort === false) {
+        dest.abort(reason);
+      }
+      rejectPipeToPromise(reason);
+    }
+  }
+
+  tee() {
+    if (IsReadableStream(this) === false) {
+      throw new TypeError('ReadableStream.prototype.tee can only be used on a ReadableStream');
+    }
+
+    const branches = TeeReadableStream(this, false);
+    return createArrayFromList(branches);
+  }
+}
+
+class ReadableStreamController {
+  constructor(stream, underlyingSource, size, highWaterMark) {
+    if (IsReadableStream(stream) === false) {
+      throw new TypeError('ReadableStreamController can only be constructed with a ReadableStream instance');
+    }
+
+    if (stream._controller !== undefined) {
+      throw new TypeError('ReadableStreamController instances can only be created by the ReadableStream constructor');
+    }
+
+    this._controlledReadableStream = stream;
+
+    this._underlyingSource = underlyingSource;
+    this._queue = [];
+    this._state = 'readable'; // this is kind of shared between ReadableStream and ReadableStreamController... not great...
+    this._started = false;
+    this._closeRequested = false;
+    this._pulling = false;
+    this._pullAgain = false;
+
+    const normalizedStrategy = ValidateAndNormalizeQueuingStrategy(size, highWaterMark);
+    this._strategySize = normalizedStrategy.size;
+    this._strategyHWM = normalizedStrategy.highWaterMark;
+
+    const startResult = InvokeOrNoop(underlyingSource, 'start', [this]);
+    Promise.resolve(startResult).then(
+      () => {
+        this._started = true;
+        RequestReadableStreamPull(this);
+      },
+      r => {
+        if (this._state === 'readable') {
+          return ErrorReadableStream(this, r);
+        }
+      }
+    )
+    .catch(rethrowAssertionErrorRejection);
+  }
+
+  get desiredSize() {
+    if (IsReadableStreamController(this) === false) {
+      throw new TypeError(
+        'ReadableStreamController.prototype.desiredSize can only be used on a ReadableStreamController');
+    }
+
+    return GetReadableStreamDesiredSize(this);
+  }
+
+  close() {
+    if (IsReadableStreamController(this) === false) {
+      throw new TypeError('ReadableStreamController.prototype.close can only be used on a ReadableStreamController');
+    }
+
+    if (this._closeRequested === true) {
+      throw new TypeError('The stream has already been closed; do not close it again!');
+    }
+    if (this._state === 'errored') {
+      throw new TypeError('The stream is in an errored state and cannot be closed');
+    }
+
+    return CloseReadableStream(this);
+  }
+
+  // Contract: must return a promise fulfilled with undefined if cancelation is successful, or rejected if it is not
+  // Will be called at most once
+  // After it is called nothing else will be called (I think)
+  _Cancel(reason) {
+    this._queue = [];
+
+    return PromiseInvokeOrNoop(this._underlyingSource, 'cancel', [reason]).then(() => undefined);
+  }
+}
+
+function AcquireReadableStreamReader(stream) {
+  return new ReadableStreamReader(stream._controller);
+}
+
+function GetReadableStreamDesiredSize(controller) {
+  const queueSize = GetTotalQueueSize(controller._queue);
+  return controller._strategyHWM - queueSize;
+}
+
+function CloseReadableStream(controller) {
+  assert(controller._closeRequested === false);
+  assert(controller._state !== 'errored');
+
+  if (controller._state === 'closed') {
+    // This will happen if the stream was closed without calling its controller's close() method, i.e. if it was closed
+    // via cancellation.
+    return undefined;
+  }
+
+  controller._closeRequested = true;
+
+  if (controller._queue.length === 0) {
+    controller._state = 'closed';
+    return FinishClosingReadableStream(controller._controlledReadableStream);
+  }
+}
+
+function FinishClosingReadableStream(stream) {
+  const reader = stream._reader;
+
+  if (reader === undefined) {
+    return undefined;
+  }
+
+  for (const { _resolve } of reader._readRequests) {
+    _resolve(CreateIterResultObject(undefined, true));
+  }
+  reader._readRequests = [];
+
+  reader._closedPromise_resolve(undefined);
+  reader._closedPromise_resolve = undefined;
+  reader._closedPromise_reject = undefined;
+
+  return undefined;
+}
+
+
+
+function IsReadableStream(x) {
+  if (!typeIsObject(x)) {
+    return false;
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(x, '_reader')) {
+    return false;
+  }
+
+  return true;
+}
+
+function IsReadableStreamController(x) {
+  if (!typeIsObject(x)) {
+    return false;
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(x, '_underlyingSource')) {
+    return false;
+  }
+
+  return true;
+}
+
+
+export default class ReadableStreamOld {
+  constructor(underlyingSource = {}, { size, highWaterMark = 1 } = {}) {
     this._underlyingSource = underlyingSource;
     this._queue = [];
     this._state = 'readable';
@@ -175,7 +479,7 @@ export default class ReadableStream {
   }
 }
 
-class ReadableStreamController {
+class ReadableStreamControllerOld {
   constructor(stream) {
     if (IsReadableStream(stream) === false) {
       throw new TypeError('ReadableStreamController can only be constructed with a ReadableStream instance');
@@ -245,7 +549,7 @@ class ReadableStreamController {
   }
 }
 
-class ReadableStreamReader {
+class ReadableStreamReaderOld {
   constructor(stream) {
     if (IsReadableStream(stream) === false) {
       throw new TypeError('ReadableStreamReader can only be constructed with a ReadableStream instance');
@@ -339,45 +643,6 @@ class ReadableStreamReader {
   }
 }
 
-
-function AcquireReadableStreamReader(stream) {
-  return new ReadableStreamReader(stream);
-}
-
-function CancelReadableStream(stream, reason) {
-  stream._disturbed = true;
-
-  if (stream._state === 'closed') {
-    return Promise.resolve(undefined);
-  }
-  if (stream._state === 'errored') {
-    return Promise.reject(stream._storedError);
-  }
-
-  stream._queue = [];
-  FinishClosingReadableStream(stream);
-
-  const sourceCancelPromise = PromiseInvokeOrNoop(stream._underlyingSource, 'cancel', [reason]);
-  return sourceCancelPromise.then(() => undefined);
-}
-
-function CloseReadableStream(stream) {
-  assert(stream._closeRequested === false);
-  assert(stream._state !== 'errored');
-
-  if (stream._state === 'closed') {
-    // This will happen if the stream was closed without calling its controller's close() method, i.e. if it was closed
-    // via cancellation.
-    return undefined;
-  }
-
-  stream._closeRequested = true;
-
-  if (stream._queue.length === 0) {
-    return FinishClosingReadableStream(stream);
-  }
-}
-
 function EnqueueInReadableStream(stream, chunk) {
   assert(stream._closeRequested === false);
   assert(stream._state !== 'errored');
@@ -441,45 +706,10 @@ function ErrorReadableStream(stream, e) {
   return undefined;
 }
 
-function FinishClosingReadableStream(stream) {
-  assert(stream._state === 'readable');
-
-  stream._state = 'closed';
-
-  const reader = stream._reader;
-
-  if (reader === undefined) {
-    return undefined;
-  }
-
-  for (const { _resolve } of reader._readRequests) {
-    _resolve(CreateIterResultObject(undefined, true));
-  }
-  reader._readRequests = [];
-
-  reader._closedPromise_resolve(undefined);
-  reader._closedPromise_resolve = undefined;
-  reader._closedPromise_reject = undefined;
-
-  return undefined;
-}
-
-function GetReadableStreamDesiredSize(stream) {
-  const queueSize = GetTotalQueueSize(stream._queue);
-  return stream._strategyHWM - queueSize;
-}
-
-function IsReadableStream(x) {
-  if (!typeIsObject(x)) {
-    return false;
-  }
-
-  if (!Object.prototype.hasOwnProperty.call(x, '_underlyingSource')) {
-    return false;
-  }
-
-  return true;
-}
+// function GetReadableStreamDesiredSize(stream) {
+//   const queueSize = GetTotalQueueSize(stream._queue);
+//   return stream._strategyHWM - queueSize;
+// }
 
 export function IsReadableStreamDisturbed(stream) {
   assert(IsReadableStream(stream) === true, 'IsReadableStreamDisturbed should only be used on known readable streams');
@@ -491,18 +721,6 @@ function IsReadableStreamLocked(stream) {
   assert(IsReadableStream(stream) === true, 'IsReadableStreamLocked should only be used on known readable streams');
 
   if (stream._reader === undefined) {
-    return false;
-  }
-
-  return true;
-}
-
-function IsReadableStreamController(x) {
-  if (!typeIsObject(x)) {
-    return false;
-  }
-
-  if (!Object.prototype.hasOwnProperty.call(x, '_controlledReadableStream')) {
     return false;
   }
 
