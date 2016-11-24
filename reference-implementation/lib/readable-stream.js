@@ -300,6 +300,23 @@ function IsReadableStreamLocked(stream) {
   return true;
 }
 
+function ReadableStreamClone(stream)
+{
+    assert(IsReadableStream(stream) === true);
+    assert(IsReadableStreamLocked(stream) === false, 'stream must not be locked');
+    assert(stream._disturbed === false, 'stream must not be disturbed');
+
+    let newStream = new ReadableStream();
+    newStream._readableStreamController = stream._readableStreamController;
+    newStream._state = newStream._state;
+    newStream._storedError = stream._storedError;
+
+    let teedStreams = ReadableStreamTee(newStream, true);
+
+    stream._readableStreamController = teedStreams[0]._readableStreamController;
+    return teedStreams[1];
+}
+
 function ReadableStreamTee(stream, cloneForBranch2) {
   assert(IsReadableStream(stream) === true);
   assert(typeof cloneForBranch2 === 'boolean');
